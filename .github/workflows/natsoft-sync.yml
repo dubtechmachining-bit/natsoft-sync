@@ -1,0 +1,62 @@
+name: Natsoft results sync
+
+on:
+  schedule:
+    # Every 5 minutes. UTC ranges are deliberately wide; the "gate" step below applies the real
+    # rule (Fri-Sun, 07:00-18:59 Melbourne time), so daylight saving can't throw it out.
+    - cron: "*/5 20-23 * * 4,5,6"
+    - cron: "*/5 0-9 * * 5,6,0"
+  workflow_dispatch: {}      # "Run workflow" button in the Actions tab; ignores the time window
+
+concurrency:
+  group: natsoft-sync        # never run two syncs at once
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Gate (time window + is any round due?)
+        id: gate
+        env:
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_TOKEN: ${{ secrets.WP_TOKEN }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+        run: |
+          dow=$(TZ=Australia/Melbourne date +%u)    # 1=Mon ... 7=Sun
+          hr=$(TZ=Australia/Melbourne date +%-H)
+          echo "Melbourne day=$dow hour=$hr"
+          if [ "$FORCE" != "1" ] && ! { [ "$dow" -ge 5 ] && [ "$hr" -ge 7 ] && [ "$hr" -lt 19 ]; }; then
+            echo "Outside Fri-Sun 07:00-19:00 Melbourne time; skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if due=$(curl -fsS -H "X-Natsoft-Token: $WP_TOKEN" "$WP_URL/?rest_route=/natsoft/v1/pending" | jq '.rounds | length'); then
+            echo "Rounds due: $due"
+            if [ "$due" = "0" ]; then echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          else
+            echo "Could not read pending rounds from WordPress; running the full sync so the error shows."
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          node-version: 20
+      - name: Cache Playwright browser
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package.json') }}
+      - if: steps.gate.outputs.run == 'true'
+        run: npm install
+      - if: steps.gate.outputs.run == 'true'
+        run: npx playwright install --with-deps chromium
+      - if: steps.gate.outputs.run == 'true'
+        run: node sync.js
+        env:
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_TOKEN: ${{ secrets.WP_TOKEN }}
